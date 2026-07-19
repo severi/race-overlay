@@ -7,6 +7,11 @@ each moment — or each video clip — was filmed. Drop them onto your footage i
 DaVinci Resolve (or any NLE); no keying needed. Works for any point-to-point
 event: ultras, marathons, bike races.
 
+![Example overlay](docs/example.png)
+
+*The actual PNGs have a fully transparent background — shown here on a dark
+backdrop.*
+
 Each overlay shows:
 
 - the full course elevation profile (completed part emphasized, remaining
