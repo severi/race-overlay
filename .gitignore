@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Personal activity data (GPS/heart-rate) & generated overlays
+imports/
+overlays/
+overlays_clips/
+*.fit
+*.FIT
+*.gpx
+
+# macOS
+.DS_Store

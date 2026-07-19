@@ -1,0 +1,62 @@
+# Event configuration for race-overlay.
+# Copy/edit this file for your own event, or pass another file with --event.
+# This example: Race to the Stones 2026 (100 km, Threshold Trail Series).
+
+[event]
+name = "Race to the Stones 2026"
+total_km = 100.1        # official course length — the profile x-axis ends here
+finish_label = "FINISH"
+utc_offset_hours = 1    # race-local clock vs UTC (UK summer = BST = +1)
+
+# Checkpoints / aid stations, at their OFFICIAL course distances.
+#   label     — short text drawn on the chart
+#   km        — official course distance
+#   name      — longer name used in the "Next ..." status line (optional)
+#   highlight — true for a distinct star marker (e.g. halfway basecamp)
+[[checkpoints]]
+label = "PS1"
+km = 9.0
+
+[[checkpoints]]
+label = "PS2"
+km = 21.6
+
+[[checkpoints]]
+label = "PS3"
+km = 36.0
+
+[[checkpoints]]
+label = "PS4 ½"
+name = "PS4 Basecamp"
+km = 49.6
+highlight = true
+
+[[checkpoints]]
+label = "PS5"
+km = 57.9
+
+[[checkpoints]]
+label = "PS6"
+km = 71.3
+
+[[checkpoints]]
+label = "PS7"
+km = 88.2
+
+[alignment]
+# How to map your GPS track's recorded distance onto the official course km:
+#   "checkpoints" — anchor on rest stops auto-detected from Garmin Ultra Run
+#                   rest laps, matched to the checkpoint kms (most accurate;
+#                   falls back to linear if nothing is detected)
+#   "linear"      — uniformly rescale so the track total = event total_km
+#   "none"        — use raw recorded distance
+mode = "checkpoints"
+rest_max_speed_ms = 0.5     # a manual lap slower than this is a rest...
+rest_min_duration_s = 60    # ...if it lasted at least this long
+match_tolerance_km = 2.5    # max distance between a rest and a checkpoint
+
+[camera]
+# Clock timezone of cameras whose files lack timezone metadata (e.g. GoPro).
+# iPhone .MOV files carry their own timezone and ignore this.
+# Example: GoPro synced to a Finnish phone during a UK race -> UTC+3.
+utc_offset_hours = 3
