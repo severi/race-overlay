@@ -121,6 +121,9 @@ def load_event(path=None):
 
     al = cfg.get("alignment", {})
     DISTANCE_ALIGN = al.get("mode", DISTANCE_ALIGN)
+    if DISTANCE_ALIGN not in ("checkpoints", "linear", "none"):
+        sys.exit(f"{path}: invalid alignment.mode {DISTANCE_ALIGN!r} "
+                 f"(expected checkpoints, linear or none)")
     REST_MAX_SPEED_MS = float(al.get("rest_max_speed_ms", REST_MAX_SPEED_MS))
     REST_MIN_DURATION_S = float(al.get("rest_min_duration_s",
                                        REST_MIN_DURATION_S))
@@ -222,7 +225,9 @@ def parse_fit(path):
     for m in fit.get_messages("record"):
         v = {f.name: f.value for f in m}
         t = v.get("timestamp")
-        e = v.get("enhanced_altitude", v.get("altitude"))
+        e = v.get("enhanced_altitude")
+        if e is None:
+            e = v.get("altitude")
         if t is None or e is None:
             continue
         ts.append(t)
@@ -280,6 +285,10 @@ def parse_gpx(path):
                       .astimezone(timezone.utc).replace(tzinfo=None))
         else:
             ts.append(None)
+    if any(t is None for t in ts):
+        # partial/missing timestamps (e.g. an exported course file): disable
+        # all time-based features rather than guessing
+        ts = [None] * len(ts)
     dist = _cumulative_from_coords(lat, lon)
     return Track(ts, [d / 1000.0 for d in dist], ele, [])
 
@@ -298,10 +307,18 @@ def _cumulative_from_coords(lat, lon):
 def load_track(path):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".fit":
-        return parse_fit(path)
-    if ext == ".gpx":
-        return parse_gpx(path)
-    sys.exit(f"Unsupported file type: {ext} (expected .fit or .gpx)")
+        track = parse_fit(path)
+    elif ext == ".gpx":
+        track = parse_gpx(path)
+    else:
+        sys.exit(f"Unsupported file type: {ext} (expected .fit or .gpx)")
+    if len(track.dist_km) < 2 or track.dist_km[-1] <= 0:
+        sys.exit(f"{path}: no usable distance data in the activity file")
+    return track
+
+
+def has_timestamps(track):
+    return bool(track.ts) and track.ts[0] is not None
 
 
 # ============================================================================
@@ -343,6 +360,15 @@ def build_km_mapper(track, mode):
     if len(anchors) < 3:  # no usable rests detected -> plain linear
         return linear, "linear rescale (no rest stops detected to anchor on)"
 
+    # the mapping must be strictly increasing in both track km and course km;
+    # a rest matched to the wrong checkpoint would silently corrupt every
+    # lookup, so refuse and fall back to linear instead
+    for (x0, y0), (x1, y1) in zip(anchors, anchors[1:]):
+        if x1 <= x0 or y1 <= y0:
+            return linear, (
+                "linear rescale (detected rests match checkpoints out of "
+                "order — check the checkpoint kms / match_tolerance_km)")
+
     xs = [a[0] for a in anchors]
     ys = [a[1] for a in anchors]
 
@@ -351,7 +377,7 @@ def build_km_mapper(track, mode):
         x0, x1, y0, y1 = xs[i - 1], xs[i], ys[i - 1], ys[i]
         return y0 + (km - x0) * (y1 - y0) / (x1 - x0)
 
-    report = "piecewise via detected pit stops:\n    " + "\n    ".join(matched)
+    report = "piecewise via detected rest stops:\n    " + "\n    ".join(matched)
     return piecewise, report
 
 
@@ -412,6 +438,9 @@ def resolve_position(spec, track, map_fn):
     """'34', 'km 34', '09:30:00' or ISO datetime -> (official_km, source_desc)."""
     s = spec.strip().lower().removeprefix("km").strip()
     if TIME_RE.match(s) or "t" in s or "-" in s:
+        if not has_timestamps(track):
+            sys.exit(f"Cannot resolve '{spec}': the activity file has no "
+                     f"timestamps — use --km positions instead")
         t = _parse_time_input(s, track)
         i = min(bisect_left(track.ts, t), len(track.ts) - 1)
         if i > 0 and abs((track.ts[i - 1] - t).total_seconds()) < abs(
@@ -431,7 +460,13 @@ def _parse_time_input(s, track):
         h, m, *rest = [int(x) for x in s.split(":")]
         sec = rest[0] if rest else 0
         day = (track.ts[0] + off).date()
-        return datetime(day.year, day.month, day.day, h, m, sec) - off
+        t = datetime(day.year, day.month, day.day, h, m, sec) - off
+        # races can cross midnight: a clock time before the start means the
+        # following day (e.g. 00:15 on a race that started at 07:00)
+        if t < track.ts[0] and t + timedelta(days=1) <= track.ts[-1] \
+                + timedelta(hours=1):
+            t += timedelta(days=1)
+        return t
     return datetime.fromisoformat(s) - off  # full local datetime
 
 
@@ -610,7 +645,7 @@ def make_label(here_km, when_utc=None, start_utc=None, moving_s=None,
     """Label layout dict for render():
 
       value/unit — big top-left ('34' / 'KM'; custom text replaces both)
-      gain       — small top-left, under the value ('↑ 812 m')
+      gain       — small top-left, under the value ('+812 m')
       right      — stacked top-right lines (elapsed / moving time)
       bottom     — status strip under the graph ('11:36 · Next PS3 · 2.0 km')
     """
@@ -748,9 +783,10 @@ def main():
         ap.error("no positions given (use --km, --ts and/or --pos-file)")
 
     track = load_track(args.activity)
+    span = (f", {track.ts[0]} -> {track.ts[-1]} UTC"
+            if has_timestamps(track) else ", no timestamps")
     print(f"Track: {len(track.dist_km)} points, "
-          f"{track.dist_km[-1]:.2f} km recorded, "
-          f"{track.ts[0]} -> {track.ts[-1]} UTC")
+          f"{track.dist_km[-1]:.2f} km recorded{span}")
     if track.rests:
         print("Detected standstills (rest laps):")
         for km, dur in track.rests:
@@ -763,9 +799,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     burn = BURN_LABEL and not args.no_label
-    show_time = SHOW_TIME and not args.no_time
-    time_at = make_time_lookup(track, map_fn)
-    moving_at = make_moving_lookup(track)
+    show_time = SHOW_TIME and not args.no_time and has_timestamps(track)
+    time_at = make_time_lookup(track, map_fn) if show_time else None
+    moving_at = make_moving_lookup(track) if show_time else None
     gain_at = make_gain_lookup(track, map_fn)
     for spec, custom in specs:
         km, desc = resolve_position(spec, track, map_fn)

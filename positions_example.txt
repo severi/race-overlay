@@ -1,6 +1,6 @@
-# Race to the Stones — GoPro clip positions
-# one per line: km value, "km 34", or clock time HH:MM[:SS]
-# optional custom label after a pipe
+# Example positions file for race_overlay.py --pos-file
+# One position per line: km value, "km 34", or clock time HH:MM[:SS]
+# Optional custom label after a pipe
 0
 km 34
 14:30:00 | Basecamp lunch

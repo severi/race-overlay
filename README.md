@@ -4,10 +4,8 @@ Elevation-profile **"you are here" overlays for race videos**. Parses your
 GPS activity file (.fit / .gpx), draws the course elevation profile with the
 event's checkpoints, and renders transparent PNGs showing where on the course
 each moment — or each video clip — was filmed. Drop them onto your footage in
-DaVinci Resolve (or any NLE); no keying needed.
-
-Built for a [Race to the Stones](https://www.thresholdtrailseries.com/events/race-to-the-stones/)
-100 km ultra, works for any point-to-point event.
+DaVinci Resolve (or any NLE); no keying needed. Works for any point-to-point
+event: ultras, marathons, bike races.
 
 Each overlay shows:
 

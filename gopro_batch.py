@@ -61,9 +61,10 @@ def mvhd_info(path):
                     data = f.read(32)
                     if data[0] == 0:
                         ctime, _, tscale, dur = struct.unpack(">IIII", data[4:20])
-                    else:
+                    else:  # version 1: 64-bit creation time and duration
                         ctime = struct.unpack(">Q", data[4:12])[0]
-                        tscale, dur = struct.unpack(">II", data[20:28])
+                        tscale = struct.unpack(">I", data[20:24])[0]
+                        dur = struct.unpack(">Q", data[24:32])[0]
                     return (EPOCH_1904 + datetime.timedelta(seconds=ctime),
                             dur / tscale)
                 pos += alen
@@ -117,6 +118,9 @@ def main():
                   else ro.CAMERA_UTC_OFFSET_HOURS)
 
     track = load_track(args.activity)
+    if not ro.has_timestamps(track):
+        raise SystemExit("Mapping clips to course positions needs an "
+                         "activity file with timestamps")
     moving_at = make_moving_lookup(track)
     map_fn, report = build_km_mapper(track, args.align)
     gain_at = make_gain_lookup(track, map_fn)
