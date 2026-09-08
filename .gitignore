@@ -5,8 +5,7 @@ __pycache__/
 
 # Personal activity data (GPS/heart-rate) & generated overlays
 imports/
-overlays/
-overlays_clips/
+overlays*/
 *.fit
 *.FIT
 *.gpx

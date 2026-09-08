@@ -1,0 +1,50 @@
+# Nuuksio Classic Trail Marathon 2026 (42 km loop, Solvalla, Finland).
+# A second example event: single loop, drawn as a 2-D route map.
+# Run with:  --event events/nuuksio-classic-2026.toml
+
+[event]
+name = "Nuuksio Classic Trail Marathon 2026"
+total_km = 42.0         # official course length
+finish_label = "FINISH" # start = finish (loop), so only the finish is drawn
+finish_label_pos = "s"  # map view: compass side of the finish label
+utc_offset_hours = 3    # race-local clock vs UTC (Finland, EEST = +3)
+view = "map"            # "map" = 2-D route seen from above, "profile" =
+                        # elevation profile (the default)
+
+# Aid stations at their official course distances (nuuksioclassic.com).
+# label_pos (map view only): compass side the label is drawn on, to keep
+# it clear of the route line — n/ne/e/se/s/sw/w/nw, default n.
+[[checkpoints]]
+label = "AS1"
+name = "Högbacka"
+km = 15.3
+label_pos = "se"
+
+[[checkpoints]]
+label = "AS2"
+name = "Valklammentie"
+km = 24.3
+label_pos = "w"
+
+[[checkpoints]]
+label = "AS3"
+name = "Kolmoislammentie"
+km = 34.0
+label_pos = "s"
+
+[alignment]
+# No manual rest laps on this run (auto 1 km laps), so standstills are
+# detected from the track samples themselves and matched to the stations.
+mode = "checkpoints"
+rest_max_speed_ms = 0.5
+rest_min_duration_s = 60
+match_tolerance_km = 2.5
+
+[camera]
+# DJI Osmo Action writes the MP4 creation time in UTC (the file name carries
+# the camera's local time), so no timezone offset is needed.
+utc_offset_hours = 0
+# The camera clock was 11 s behind the watch: at all three aid stations the
+# footage shows the stop/start ~11 s before the track does. Added to every
+# clip's start time.
+clock_behind_s = 11
