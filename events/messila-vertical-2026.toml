@@ -1,0 +1,35 @@
+# HOKA Messilä Vertical 2026 (Messilä ski centre, Hollola, Finland):
+# as many 1.2 km loops up and down the ski slope as you can in 4 hours.
+# A third example event: a timed lap race, drawn as the profile of one loop.
+# Run with:  --event events/messila-vertical-2026.toml
+
+[event]
+name = "HOKA Messilä Vertical 2026"
+utc_offset_hours = 3    # race-local clock vs UTC (Finland, EEST = +3)
+view = "laps"           # one-loop elevation profile + lap counter + countdown
+# No total_km: a timed race has no course length, distances stay as recorded.
+# The loop is a sharp up-and-down, which the default 100 m smoothing of the
+# ascent total rounds off (2037 m vs the watch's 2100 m); 40 m lands on it.
+gain_smooth_window_m = 40
+
+[laps]
+time_limit_h = 4        # the countdown; the watch was started on the gun
+lap_km = 1.2            # official loop length (x-axis of the loop profile)
+# Laps are found from the GPS track: every return to within start_radius_m
+# of the first fix is a lap boundary (the lap button is ignored — one missed
+# press would merge two loops). Visits under min_lap_s apart are one visit.
+start_radius_m = 30
+min_lap_s = 120
+# Only loops completed inside the time limit count here; the one still in
+# progress at 4:00:00 is drawn as "not counted" from that moment on.
+late_lap_counts = false
+
+[camera]
+# DJI Osmo Action writes the MP4 creation time in UTC (see the Nuuksio
+# example), so no timezone offset is needed.
+utc_offset_hours = 0
+# The camera clock was ~15 s behind the watch: the start clip shows the
+# field setting off at 09:59:47 camera time (watch started 10:00:01, track
+# moves from 10:00:03), and the footage reaches the aid table before the
+# track does. Added to every clip's start time.
+clock_behind_s = 15

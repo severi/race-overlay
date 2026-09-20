@@ -93,7 +93,8 @@ def _label_key(label):
     if label is None:
         return None
     return (label["value"], label["gain"], tuple(label["right"]),
-            label["bottom"], tuple(label.get("live") or []))
+            label["bottom"], tuple(label.get("live") or []),
+            repr(label.get("laps")), label.get("countdown"))
 
 
 def _render_clip_video(job):
@@ -223,7 +224,7 @@ def main():
     map_fn, report = build_km_mapper(track, args.align)
     gain_at = make_gain_lookup(track, map_fn)
     print(f"Distance alignment: {report}")
-    course = prepare_course(track, map_fn)
+    course = prepare_course(track, map_fn, laps=args.view == "laps")
     os.makedirs(args.out_dir, exist_ok=True)
 
     def lookup(utc_t):
@@ -240,7 +241,9 @@ def main():
                                gain_at(km),
                                hr=hr_at(utc_t) if args.hr else None,
                                pace_s_km=pace_at(utc_t) if args.pace else None,
-                               show_hr=args.hr, show_pace=args.pace)
+                               show_hr=args.hr, show_pace=args.pace,
+                               laps=(course.laps.state(km, utc_t)
+                                     if course.laps else None))
         return km, label
 
     _W.update(track=track, course=course, lookup=lookup, args=args)

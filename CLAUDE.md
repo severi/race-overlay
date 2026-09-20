@@ -1,8 +1,8 @@
 # CLAUDE.md
 
-Transparent "you are here" overlay PNGs (elevation profile or 2-D route
-map) for race videos. User-facing usage is in README.md — don't duplicate
-it here.
+Transparent "you are here" overlay PNGs (elevation profile, 2-D route map
+or lap-race loop profile) for race videos. User-facing usage is in
+README.md — don't duplicate it here.
 
 ## Commands
 
@@ -18,8 +18,9 @@ No test suite; verify visually (see below).
 ## Architecture
 
 - `race_overlay.py` — everything: TOML event config loading, FIT/GPX parsing,
-  distance alignment, stat lookups, matplotlib rendering (`_render_profile`
-  and `_render_map`, dispatched by `render()` on `args.view`), CLI.
+  distance alignment, stat lookups, matplotlib rendering (`_render_profile`,
+  `_render_map` and `_render_laps`, dispatched by `render()` on
+  `args.view`), CLI.
   `gopro_batch.py` imports it as a library (`import race_overlay as ro`) and
   mutates its module globals via `ro.load_event()` — import values
   dynamically (`ro.OFFICIAL_TOTAL_KM`), never `from race_overlay import
@@ -29,7 +30,8 @@ No test suite; verify visually (see below).
   course length, timezones, camera clock offset, view, label sides). Never
   hardcode event details in code; the repo is generic and public
   (github.com/severi/race-overlay). `event.toml` = RTTS profile example,
-  `events/nuuksio-classic-2026.toml` = loop-course map example.
+  `events/nuuksio-classic-2026.toml` = loop-course map example,
+  `events/messila-vertical-2026.toml` = timed lap race (laps view).
 - `resolve_add_overlays.py` — runs inside DaVinci Resolve (free edition =
   Workspace > Scripts only, no external API), matches timeline clips to
   `overlay_<stem>_km*.mov` (from `gopro_batch.py --mov`: QuickTime
@@ -94,6 +96,17 @@ bg.alpha_composite(img)
   12 s was rejected as too laggy, a deadband was declined). Display rounds
   to 5 s. Verified frame by frame against the three aid-station clips;
   don't simplify to a single channel — that was tried and rejected.
+- Laps view: `prepare_laps` finds lap boundaries geometrically (passes of
+  the first GPS fix), NOT from FIT laps — the Messilä file has a missed
+  button press (first manual lap = two loops). All lap logic lives in
+  `Laps.state(km, when)`; the label carries that dict (`label["laps"]`) and
+  `_render_laps` draws from it. Two numbers, two meanings, never swapped
+  mid-race (owner's call): big `LAP n` = lap in progress, `n completed` =
+  laps that count. A lap overrunning the time limit turns "not counted" at
+  the limit, not before. Timed lap events have no `total_km`
+  (`OFFICIAL_TOTAL_KM = inf`, alignment `none`); other views refuse that.
+  The loop profile is the per-fraction median of all laps, lightly smoothed
+  (`LOOP_SMOOTH_WINDOW_M`) — the normal 150 m window shaves the summit.
 - Map view: the stats column is drawn first and measured, and the map axes
   take the remaining width (long "Next <name>" lines widen the column).
   Route is a flat equirectangular projection around the track centre — fine

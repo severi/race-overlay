@@ -2,9 +2,9 @@
 """
 race_overlay.py — "you are here" overlay PNGs for race videos.
 
-Parses a .fit or .gpx activity file, draws the course either as an elevation
-profile or as a 2-D route map (event.view / --view) with the event's
-checkpoints marked, stamps a "you are here" marker for each requested
+Parses a .fit or .gpx activity file, draws the course as an elevation
+profile, as a 2-D route map or — for lap races — as the profile of one loop
+with a lap counter (event.view / --view) with the event's checkpoints marked, stamps a "you are here" marker for each requested
 position, and writes one transparent-background PNG per position — ready to
 composite onto action-cam footage in DaVinci Resolve or any NLE.
 
@@ -29,6 +29,10 @@ Usage examples:
     # 2-D route map instead of the elevation profile
     python race_overlay.py my_run.fit --view map --km 20
 
+    # lap race (laps found from the GPS track; see the [laps] config table)
+    python race_overlay.py my_run.fit --event events/my-lap-race.toml \
+        --ts 12:48
+
 Requires: matplotlib, and fitparse for .fit input (Python 3.11+).
 """
 
@@ -40,7 +44,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -56,7 +60,7 @@ from matplotlib import patheffects
 # ============================================================================
 
 DEFAULT_EVENT_FILE = "event.toml"
-VIEWS = ("profile", "map")
+VIEWS = ("profile", "map", "laps")
 
 # Compass point -> (dx, dy) label offset in points, and text alignment.
 LABEL_OFFSETS = {
@@ -76,9 +80,23 @@ FINISH_LABEL = "FINISH"
 START_LABEL = "START"       # map view only, drawn when start != finish
 FINISH_LABEL_POS = "n"      # map view: compass side of the finish label
 
-# What to draw: "profile" (elevation profile, distance on the x-axis) or
-# "map" (2-D route seen from above). Override per-run with --view.
+# What to draw: "profile" (elevation profile, distance on the x-axis),
+# "map" (2-D route seen from above) or "laps" (lap race: the profile of ONE
+# loop with the marker going round it, lap counter, countdown). Override
+# per-run with --view.
 VIEW = "profile"
+
+# [laps] — lap races (as many loops as you can in a time limit, or a fixed
+# number of loops). Laps are counted from the GPS track: every return to
+# the start point (the first fix) is a lap boundary; the watch's lap button
+# is ignored (a missed press would merge two loops).
+LAP_TIME_LIMIT_H = None     # race time limit, hours (None: no countdown)
+LAP_KM = None               # official loop length (None: median recorded)
+LAP_START_RADIUS_M = 30.0   # a pass this close to the start point = boundary
+LAP_MIN_S = 120.0           # ... unless the previous one was under this ago
+# Does the lap in progress when the time runs out still count? If not, it
+# is drawn as "not counted" from the moment the limit passes.
+LATE_LAP_COUNTS = False
 
 # How to align the GPS track's distance to the official course-km scale:
 #   "checkpoints" — piecewise-linear through rest stops auto-detected from
@@ -115,9 +133,10 @@ def load_event(path=None):
     """Load an event TOML file into the module-level config globals."""
     import tomllib
     global CHECKPOINTS, OFFICIAL_TOTAL_KM, FINISH_LABEL, START_LABEL, \
-        FINISH_LABEL_POS, VIEW, \
-        DISTANCE_ALIGN, REST_MAX_SPEED_MS, REST_MIN_DURATION_S, \
-        MATCH_TOLERANCE_KM, LOCAL_UTC_OFFSET_HOURS, CAMERA_UTC_OFFSET_HOURS, \
+        FINISH_LABEL_POS, VIEW, LAP_TIME_LIMIT_H, LAP_KM, \
+        LAP_START_RADIUS_M, LAP_MIN_S, LATE_LAP_COUNTS, \
+        GAIN_SMOOTH_WINDOW_M, DISTANCE_ALIGN, REST_MAX_SPEED_MS, \
+        REST_MIN_DURATION_S, MATCH_TOLERANCE_KM, LOCAL_UTC_OFFSET_HOURS, CAMERA_UTC_OFFSET_HOURS, \
         CAMERA_CLOCK_BEHIND_S
 
     path = path or DEFAULT_EVENT_FILE
@@ -129,17 +148,22 @@ def load_event(path=None):
         cfg = tomllib.load(f)
 
     ev = cfg.get("event", {})
-    OFFICIAL_TOTAL_KM = float(ev.get("total_km", OFFICIAL_TOTAL_KM))
+    VIEW = ev.get("view", VIEW)
+    if VIEW not in VIEWS:
+        sys.exit(f"{path}: invalid event.view {VIEW!r} "
+                 f"(expected {', '.join(VIEWS)})")
+    # a timed lap race has no course length: distance stays as recorded
+    open_ended = VIEW == "laps" and "total_km" not in ev
+    OFFICIAL_TOTAL_KM = (math.inf if open_ended else
+                         float(ev.get("total_km", OFFICIAL_TOTAL_KM)))
+    GAIN_SMOOTH_WINDOW_M = float(ev.get("gain_smooth_window_m",
+                                        GAIN_SMOOTH_WINDOW_M))
     FINISH_LABEL = ev.get("finish_label", FINISH_LABEL)
     START_LABEL = ev.get("start_label", START_LABEL)
     FINISH_LABEL_POS = str(ev.get("finish_label_pos", FINISH_LABEL_POS)).lower()
     if FINISH_LABEL_POS not in LABEL_OFFSETS:
         sys.exit(f"{path}: event.finish_label_pos must be one of "
                  f"{', '.join(LABEL_OFFSETS)}")
-    VIEW = ev.get("view", VIEW)
-    if VIEW not in VIEWS:
-        sys.exit(f"{path}: invalid event.view {VIEW!r} "
-                 f"(expected {' or '.join(VIEWS)})")
     LOCAL_UTC_OFFSET_HOURS = float(ev.get("utc_offset_hours",
                                           LOCAL_UTC_OFFSET_HOURS))
 
@@ -159,8 +183,17 @@ def load_event(path=None):
                      f"one of {', '.join(LABEL_OFFSETS)}")
     CHECKPOINTS.sort(key=lambda c: c["km"])
 
+    lp = cfg.get("laps", {})
+    limit = lp.get("time_limit_h", LAP_TIME_LIMIT_H)
+    LAP_TIME_LIMIT_H = float(limit) if limit is not None else None
+    lap_km = lp.get("lap_km", LAP_KM)
+    LAP_KM = float(lap_km) if lap_km is not None else None
+    LAP_START_RADIUS_M = float(lp.get("start_radius_m", LAP_START_RADIUS_M))
+    LAP_MIN_S = float(lp.get("min_lap_s", LAP_MIN_S))
+    LATE_LAP_COUNTS = bool(lp.get("late_lap_counts", LATE_LAP_COUNTS))
+
     al = cfg.get("alignment", {})
-    DISTANCE_ALIGN = al.get("mode", DISTANCE_ALIGN)
+    DISTANCE_ALIGN = al.get("mode", "none" if open_ended else DISTANCE_ALIGN)
     if DISTANCE_ALIGN not in ("checkpoints", "linear", "none"):
         sys.exit(f"{path}: invalid alignment.mode {DISTANCE_ALIGN!r} "
                  f"(expected checkpoints, linear or none)")
@@ -183,6 +216,9 @@ IMG_WIDTH_PX = 1280
 IMG_HEIGHT_PX = 400
 IMG_DPI = 100
 # The map view is squarer: stats column on the left, route on the right.
+LAP_PIP_PITCH_PX = 17               # laps view: spacing / radius of the lap
+LAP_PIP_RADIUS_PX = 5               # pips (shrunk to fit when there are many)
+LAP_URGENT_S = 600                  # countdown turns accent under this
 MAP_IMG_WIDTH_PX = 960
 MAP_IMG_HEIGHT_PX = 480
 MAP_TEXT_COL_PX = 330               # width of the stats column (map view)
@@ -497,6 +533,7 @@ class Course:
     rx: list            # route: local east metres per vertex (map view)
     ry: list            # route: local north metres per vertex
     rkm: list           # route: official km per vertex
+    laps: "Laps | None" = None  # laps view only
 
 
 def _smooth_elevation(kms, ele, window_m=None):
@@ -515,12 +552,14 @@ def _smooth_elevation(kms, ele, window_m=None):
     return smooth
 
 
-def prepare_course(track, map_fn):
-    """Downsampled profile and route polylines on the official-km scale."""
+def prepare_course(track, map_fn, laps=False):
+    """Downsampled profile and route polylines on the official-km scale;
+    with laps=True (laps view) also the detected laps + loop profile."""
     kms = [map_fn(d) for d in track.dist_km]
     px, py = _prepare_profile(kms, track.ele)
     rx, ry, rkm = _prepare_route(kms, track.lat, track.lon)
-    return Course(px, py, rx, ry, rkm)
+    return Course(px, py, rx, ry, rkm,
+                  prepare_laps(track, kms) if laps else None)
 
 
 def _prepare_profile(kms, ele):
@@ -562,6 +601,168 @@ def _prepare_route(kms, lat, lon):
     ry.append((la - lat0) * my)
     rkm.append(k)
     return rx, ry, rkm
+
+
+# ============================================================================
+# Laps (laps view): boundaries from the GPS track, one averaged loop profile
+# ============================================================================
+
+LOOP_PROFILE_POINTS = 240   # vertices of the loop profile
+LOOP_SMOOTH_WINDOW_M = 40   # light: averaging the laps already kills noise,
+                            # and a wide window would shave the summit
+LAP_TAIL_MIN_FRACTION = 0.25  # track left after the last crossing is a lap
+                              # in progress if at least this much of a loop
+                              # (less = milling about after the finish)
+
+
+@dataclass
+class Laps:
+    ts: list            # boundary times: start, then every start-line pass
+    kms: list           # course km at those boundaries
+    tail: bool          # the track ends mid-lap (last boundary is synthetic)
+    lap_km: float       # loop length the profile is drawn over
+    lx: list            # loop profile: km within the loop
+    ly: list            # loop profile: elevation
+    track_ts: list      # per-sample time / km, to find the time of a km
+    track_kms: list
+
+    @property
+    def count(self):
+        return len(self.ts) - 1
+
+    def _counts(self, j, limit_t):
+        """Does lap j (0-based) count towards the result?"""
+        if self.tail and j == self.count - 1:
+            return False
+        if limit_t is None or self.ts[j + 1] <= limit_t:
+            return True
+        return LATE_LAP_COUNTS and self.ts[j] < limit_t
+
+    def state(self, km, when=None):
+        """Everything the HUD shows about laps at course km / time `when`
+        (UTC; defaults to the first moment the track reached that km)."""
+        if when is None:
+            i = min(bisect_left(self.track_kms, km), len(self.track_ts) - 1)
+            when = self.track_ts[i]
+        when = min(max(when, self.ts[0]), self.track_ts[-1])
+        limit_t = (self.ts[0] + timedelta(hours=LAP_TIME_LIMIT_H)
+                   if LAP_TIME_LIMIT_H else None)
+        n = bisect_right(self.ts, when) - 1          # lap in progress
+        finished = n >= self.count
+        past_limit = limit_t is not None and when >= limit_t
+
+        pips = []
+        for j in range(self.count):
+            counts = self._counts(j, limit_t)
+            if not counts and past_limit and (j <= n or finished):
+                pips.append("void")
+            elif j < n:
+                pips.append("done" if counts else "void")
+            else:
+                pips.append("current" if j == n else "todo")
+        completed = sum(1 for j in range(min(n, self.count))
+                        if self._counts(j, limit_t))
+
+        # the last lap that did not count (for the final read-out)
+        void = [j for j in range(min(n, self.count))
+                if not self._counts(j, limit_t)
+                and not (self.tail and j == self.count - 1)]
+        late = None
+        if void and limit_t is not None:
+            late = (void[-1] + 1,
+                    (self.ts[void[-1] + 1] - limit_t).total_seconds())
+
+        if finished:
+            frac, lap_s = 1.0, None
+            counted_now = True
+        else:
+            k0, k1 = self.kms[n], self.kms[n + 1]
+            frac = min(max((km - k0) / (k1 - k0), 0.0), 1.0) if k1 > k0 else 0
+            lap_s = (when - self.ts[n]).total_seconds()
+            counted_now = self._counts(n, limit_t) or not past_limit
+        last_s = ((self.ts[min(n, self.count)] -
+                   self.ts[min(n, self.count) - 1]).total_seconds()
+                  if n >= 1 else None)
+        return {
+            "lap": None if finished else n + 1,
+            "completed": completed,
+            "frac": frac,
+            "lap_s": lap_s,
+            "last_s": last_s,
+            "elapsed_s": (when - self.ts[0]).total_seconds(),
+            "remaining_s": ((limit_t - when).total_seconds()
+                            if limit_t is not None else None),
+            # True from the moment the limit passes on a lap that won't count
+            "void": not counted_now,
+            "finished": finished,
+            "late": late,       # (lap number, seconds over the limit)
+            "pips": pips,
+        }
+
+
+def _detect_lap_bounds(track):
+    """Sample indices where a lap starts: 0, then the closest sample of
+    every later visit to the start point (first GPS fix)."""
+    fixes = [i for i, la in enumerate(track.lat)
+             if la is not None and track.lon[i] is not None]
+    if not fixes:
+        sys.exit("The laps view needs GPS positions to find the laps")
+    i0 = fixes[0]
+    lat0, lon0 = track.lat[i0], track.lon[i0]
+    bounds, visit = [0], []
+
+    def close_visit():
+        if not visit:
+            return
+        d, i = min(visit)
+        if (track.ts[i] - track.ts[bounds[-1]]).total_seconds() >= LAP_MIN_S:
+            bounds.append(i)
+        visit.clear()
+
+    for i in fixes:
+        d = _haversine_m(lat0, lon0, track.lat[i], track.lon[i])
+        if d <= LAP_START_RADIUS_M:
+            visit.append((d, i))
+        else:
+            close_visit()
+    close_visit()
+    return bounds
+
+
+def prepare_laps(track, kms):
+    if not has_timestamps(track):
+        sys.exit("The laps view needs an activity file with timestamps")
+    bounds = _detect_lap_bounds(track)
+    if len(bounds) < 2:
+        sys.exit("No laps found: the track never returns to within "
+                 f"{LAP_START_RADIUS_M:g} m of its start "
+                 "(laps.start_radius_m)")
+    lens = sorted(kms[b] - kms[a] for a, b in zip(bounds, bounds[1:]))
+    median_km = lens[len(lens) // 2]
+
+    # one loop profile: every full lap resampled by fraction of its length,
+    # median across laps (barometer drift and GPS noise drop out)
+    n = LOOP_PROFILE_POINTS
+    columns = [[] for _ in range(n + 1)]
+    for a, b in zip(bounds, bounds[1:]):
+        lap_k, lap_e = kms[a:b + 1], track.ele[a:b + 1]
+        span = lap_k[-1] - lap_k[0]
+        if span <= 0:
+            continue
+        for c in range(n + 1):
+            columns[c].append(interp(lap_k, lap_e, lap_k[0] + span * c / n))
+    lap_km = LAP_KM or median_km
+    lx = [lap_km * c / n for c in range(n + 1)]
+    ly = [sorted(col)[len(col) // 2] for col in columns]
+    ly = _smooth_elevation(lx, ly, LOOP_SMOOTH_WINDOW_M)
+
+    ts = [track.ts[b] for b in bounds]
+    bkms = [kms[b] for b in bounds]
+    tail = kms[-1] - bkms[-1] >= LAP_TAIL_MIN_FRACTION * median_km
+    if tail:    # lap in progress when the recording ends: never completed
+        ts.append(datetime.max)
+        bkms.append(bkms[-1] + median_km)
+    return Laps(ts, bkms, tail, lap_km, lx, ly, track.ts, kms)
 
 
 def interp(px, py, x):
@@ -676,6 +877,8 @@ def render(course, here_km, out_path, label_text, args):
     canvas (e.g. 3840x2160) so it drops onto a timeline at zoom 1."""
     if args.view == "map":
         _render_map(course, here_km, out_path, label_text, args)
+    elif args.view == "laps":
+        _render_laps(course, here_km, out_path, label_text, args)
     else:
         _render_profile(course.px, course.py, here_km, out_path, label_text,
                         args)
@@ -807,6 +1010,159 @@ def _render_profile(px, py, here_km, out_path, label_text, args):
 
     fig.savefig(out_path, transparent=True, dpi=dpi)
     plt.close(fig)
+
+
+def _render_laps(course, here_km, out_path, label_text, args):
+    """Lap race: the profile of one loop, the marker going round it every
+    lap; lap counter, lap pips and the countdown around it."""
+    laps = course.laps
+    st = (label_text or {}).get("laps") or laps.state(here_km)
+    w, h, dpi = args.width, args.height, args.dpi
+    fig = plt.figure(figsize=(w / dpi, h / dpi), dpi=dpi)
+    fig.patch.set_alpha(0)
+    _draw_scrim(fig, w, h)
+    label_room = 0.27 if label_text else 0.05
+    ax = fig.add_axes([0.035, 0.155, 0.93, 0.80 - label_room])
+    ax.set_facecolor("none")
+
+    px, py, lap_km = laps.lx, laps.ly, laps.lap_km
+    floor = min(py) - ELEV_FLOOR_PAD_M
+    here = st["frac"] * lap_km
+    i = bisect_left(px, here)
+    here_ele = interp(px, py, here)
+    dx, dy = px[:i] + [here], py[:i] + [here_ele]
+    tx, ty = [here] + px[i:], [here_ele] + py[i:]
+
+    # a lap that will not count banks nothing: no bright "done" fill
+    banked = not (st["void"] or (st["finished"] and st["late"]))
+    ax.fill_between(dx, floor, dy, color=MONO, lw=0, zorder=2,
+                    alpha=ALPHA_FILL_DONE if banked else ALPHA_FILL_TODO)
+    ax.fill_between(tx, floor, ty, color=MONO, alpha=ALPHA_FILL_TODO,
+                    lw=0, zorder=2)
+    ax.plot(px, py, color=MONO, lw=LINE_WIDTH, alpha=ALPHA_LINE, zorder=3,
+            solid_capstyle="round", path_effects=_line_fx())
+    ax.plot([0, lap_km], [floor, floor], color=MONO, lw=1.0, alpha=0.45,
+            zorder=4, solid_capstyle="round")
+    if here > 0.01 * lap_km and banked:
+        ax.plot([0, here], [floor, floor], color=ACCENT, lw=3.0, alpha=0.95,
+                zorder=5, solid_capstyle="round")
+
+    # summit and low point, with their elevations
+    top = max(range(len(py)), key=py.__getitem__)
+    low = min(range(len(py)), key=py.__getitem__)
+    for idx, name, dy_pt, va in ((top, "TOP", 9, "bottom"),
+                                 (low, "LOW", 9, "bottom")):
+        ax.plot([px[idx], px[idx]], [floor, py[idx]], color=MONO, lw=0.8,
+                alpha=0.22, zorder=4)
+        ax.scatter([px[idx]], [py[idx]], s=26, color=MONO, alpha=0.95, lw=0,
+                   zorder=6)
+        ax.annotate(_tracked(f"{name} {py[idx]:.0f} m"), (px[idx], py[idx]),
+                    xytext=(0, dy_pt), textcoords="offset points",
+                    ha="center", va=va, color=MONO, fontsize=FONT_SIZE_PIT,
+                    fontweight="bold", family=FONT_FAMILY,
+                    path_effects=_text_fx(2.0, 0.65), zorder=7,
+                    annotation_clip=False)
+
+    ax.scatter([here], [here_ele], s=HERE_DOT_SIZE * 2.8, color=ACCENT,
+               alpha=0.28, lw=0, zorder=7, clip_on=False)
+    ax.scatter([here], [here_ele], s=HERE_DOT_SIZE, color=ACCENT,
+               edgecolors=MONO, linewidths=1.8, zorder=8, clip_on=False)
+
+    # bottom row: end ticks + centered status strip
+    for txt, x, ha, off in (("0", 0, "center", 0),
+                            (f"{lap_km:g} KM", lap_km, "right", 12)):
+        ax.annotate(txt, (x, floor), xytext=(off, -15),
+                    textcoords="offset points", ha=ha, color=MONO,
+                    alpha=0.95, fontsize=FONT_SIZE_AXIS, family=FONT_FAMILY,
+                    path_effects=_text_fx(2.0, 0.65), annotation_clip=False)
+    if label_text:
+        strip = " · ".join(label_text["bottom_lines"] + [
+            f"{cap} {val}" for cap, val in label_text.get("live") or []])
+        ax.annotate(_tracked(strip), (lap_km / 2, floor), xytext=(0, -15),
+                    textcoords="offset points", ha="center", color=MONO,
+                    fontsize=FONT_SIZE_LABEL_SUB, fontweight="bold",
+                    family=FONT_FAMILY, path_effects=_text_fx(2.0, 0.65),
+                    annotation_clip=False)
+        _draw_laps_header(fig, label_text, st, w, h)
+
+    ax.set_xlim(-0.006 * lap_km, 1.006 * lap_km)
+    ax.set_ylim(floor - 5, max(py) + 30)
+    ax.axis("off")
+    fig.savefig(out_path, transparent=True, dpi=dpi)
+    plt.close(fig)
+
+
+def _draw_laps_header(fig, label_text, st, w, h):
+    """'LAP 7' + completed/gain line on the left, the countdown on the
+    right, one pip per lap under the countdown."""
+    dim = st["void"]    # lap in progress no longer counts
+    vt = fig.text(0.035, 0.955, label_text["value"], ha="left", va="top",
+                  color=MONO, alpha=0.45 if dim else 1.0,
+                  fontsize=FONT_SIZE_LABEL_MAIN, fontweight="heavy",
+                  family=FONT_FAMILY,
+                  path_effects=_text_fx(2.5, 0.25 if dim else 0.6))
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    bb = vt.get_window_extent(renderer)
+    if label_text.get("unit"):
+        fig.text(bb.x1 / w + 0.010, bb.y0 / h + 0.012,
+                 _tracked(label_text["unit"]), ha="left", va="bottom",
+                 color=ACCENT if dim else MONO, fontsize=FONT_SIZE_LABEL_SUB,
+                 fontweight="bold", family=FONT_FAMILY,
+                 path_effects=_text_fx(2.0, 0.65))
+    if label_text.get("gain"):
+        fig.text(0.037, bb.y0 / h - 0.025, _tracked(label_text["gain"]),
+                 ha="left", va="top", color=MONO,
+                 fontsize=FONT_SIZE_LABEL_SUB, fontweight="bold",
+                 family=FONT_FAMILY, path_effects=_text_fx(2.0, 0.65))
+
+    clock = label_text.get("countdown")
+    if clock:
+        value, caption, urgent = clock
+        # small caption right of the value, on its baseline ("34 KM" style)
+        ct = fig.text(0.965, 0.955, _tracked(caption), ha="right", va="top",
+                      color=ACCENT if urgent else MONO,
+                      fontsize=FONT_SIZE_LABEL_SUB, fontweight="bold",
+                      family=FONT_FAMILY, path_effects=_text_fx(2.0, 0.65))
+        x1 = (ct.get_window_extent(renderer).x0 / w - 0.010 if caption
+              else 0.965)
+        cv = fig.text(x1, 0.955, value, ha="right", va="top",
+                      color=ACCENT if urgent else MONO,
+                      fontsize=FONT_SIZE_LIVE, fontweight="heavy",
+                      family=FONT_FAMILY, path_effects=_text_fx(2.5, 0.6))
+        ct.set_va("bottom")
+        ct.set_y(cv.get_window_extent(renderer).y0 / h)
+
+    # lap pips, right-aligned on the line of the completed/gain text
+    pips = st["pips"]
+    ov = fig.add_axes([0, 0, 1, 1])
+    ov.set_xlim(0, w)
+    ov.set_ylim(0, h)
+    ov.axis("off")
+    ov.set_facecolor("none")
+    k = fig.dpi / IMG_DPI
+    pitch = min(LAP_PIP_PITCH_PX * k, 0.55 * w / max(len(pips), 1))
+    r = min(LAP_PIP_RADIUS_PX * k, pitch * 0.36)
+    size = (2 * r * 72 / fig.dpi) ** 2          # scatter size, pt^2
+    y = bb.y0 - 0.025 * h - 0.5 * FONT_SIZE_LABEL_SUB * fig.dpi / 72
+    x0 = 0.965 * w - r - pitch * (len(pips) - 1)
+    fx = _line_fx(1.5, 0.45)
+    for j, pip in enumerate(pips):
+        x = x0 + j * pitch
+        if pip == "done":
+            ov.scatter([x], [y], s=size, color=MONO, alpha=0.95, lw=0,
+                       path_effects=_text_fx(1.5, 0.45))
+        elif pip == "current":
+            ov.scatter([x], [y], s=size * 1.5, color=ACCENT, edgecolors=MONO,
+                       linewidths=1.4 * k)
+        elif pip == "void":     # a cross (drawn: the font has no glyph)
+            for sx in (1, -1):
+                ov.plot([x - r, x + r], [y - sx * r, y + sx * r],
+                        color=ACCENT, lw=2.2 * k, solid_capstyle="round",
+                        path_effects=fx)
+        else:
+            ov.scatter([x], [y], s=size, facecolors="none", edgecolors=MONO,
+                       alpha=0.45, linewidths=1.4 * k)
 
 
 def _route_xy(course, km):
@@ -1013,9 +1369,14 @@ def _hm(seconds):
     return f"{mins // 60}h {mins % 60:02d}m"
 
 
+def _ms(seconds):
+    seconds = max(int(seconds), 0)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 def make_label(here_km, when_utc=None, start_utc=None, moving_s=None,
                gain_m=None, custom=None, hr=None, pace_s_km=None,
-               show_hr=False, show_pace=False):
+               show_hr=False, show_pace=False, laps=None):
     """Label layout dict for render():
 
       value/unit — big top-left ('34' / 'KM'; custom text replaces both)
@@ -1024,7 +1385,19 @@ def make_label(here_km, when_utc=None, start_utc=None, moving_s=None,
       bottom     — status strip under the graph ('11:36 · Next PS3 · 2.0 km')
       bottom_lines — the same, as separate lines (map view stacks them)
       live       — [(caption, value), ...] current heart rate / pace
+
+    With laps (a Laps.state() dict, laps view) the big value is the lap in
+    progress, the line under it the laps that count so far, and the label
+    also carries 'countdown' (value, caption, urgent) and the state itself.
     """
+    live = []
+    if show_hr:
+        live.append(("HR", f"{hr:.0f} bpm" if hr else "-- bpm"))
+    if show_pace:
+        live.append(("pace", _pace_str(pace_s_km)))
+    if laps is not None:
+        return _make_laps_label(laps, here_km, when_utc, gain_m, custom, live)
+
     if custom:
         value, unit = custom, None
     elif abs(here_km - round(here_km)) < 0.05:
@@ -1053,15 +1426,57 @@ def make_label(here_km, when_utc=None, start_utc=None, moving_s=None,
     else:
         bottom.append(FINISH_LABEL)
 
-    live = []
-    if show_hr:
-        live.append(("HR", f"{hr:.0f} bpm" if hr else "-- bpm"))
-    if show_pace:
-        live.append(("pace", _pace_str(pace_s_km)))
-
     return {"value": value, "unit": unit, "gain": gain, "right": right,
             "bottom": " · ".join(bottom), "bottom_lines": bottom,
             "live": live}
+
+
+def _make_laps_label(st, here_km, when_utc, gain_m, custom, live):
+    n = st["completed"]
+    if st["finished"]:
+        value, unit = f"{n} LAP" + ("S" if n != 1 else ""), None
+        stats = ["final"]
+    else:
+        value = f"LAP {st['lap']}"
+        unit = "not counted" if st["void"] else None
+        stats = [f"{n} completed"]
+    if custom:
+        value, unit = custom, None
+    if gain_m is not None:
+        stats.append(f"+{gain_m:.0f} m")
+    stats.append(f"{here_km:.1f} km")
+
+    bottom, countdown = [], None
+    if when_utc is not None:
+        clock = when_utc + timedelta(hours=LOCAL_UTC_OFFSET_HOURS)
+        bottom.append(f"{clock:%H:%M}")
+        left = st["remaining_s"]
+        if left is None:
+            countdown = (_hm(st["elapsed_s"]), "elapsed", False)
+        elif left > LAP_URGENT_S:
+            countdown = (_hm(left + 59), "left", False)
+        elif left > 0:
+            countdown = (_ms(left), "left", True)
+        elif st["void"]:
+            countdown = ("+" + _ms(-left), "over", True)
+        elif not st["finished"]:
+            countdown = ("FINAL LAP", "", True)
+        else:
+            countdown = ("TIME", "", False)
+        if st["finished"]:
+            if st["late"]:
+                lap, over_s = st["late"]
+                bottom.append(f"lap {lap} finished {_ms(over_s)} over")
+            elif st["last_s"] is not None:
+                bottom.append(f"last lap {_ms(st['last_s'])}")
+        else:
+            bottom.append(f"this lap {_ms(st['lap_s'])}")
+            if st["last_s"] is not None:
+                bottom.append(f"last {_ms(st['last_s'])}")
+    return {"value": value, "unit": unit, "gain": " · ".join(stats),
+            "right": [], "bottom": " · ".join(bottom),
+            "bottom_lines": bottom, "live": live, "countdown": countdown,
+            "laps": st}
 
 
 def _pace_str(s_per_km):
@@ -1224,7 +1639,7 @@ def make_gain_lookup(track, map_fn):
 def add_render_args(ap):
     """--view/--width/--height/--dpi/--align, shared with gopro_batch.py."""
     ap.add_argument("--view", choices=VIEWS, default=None,
-                    help="elevation profile or 2-D route map "
+                    help="elevation profile, 2-D route map or lap race "
                          "(default: from event config)")
     ap.add_argument("--width", type=int, default=None,
                     help=f"image width px (default {IMG_WIDTH_PX} profile / "
@@ -1272,6 +1687,10 @@ def resolve_render_args(args):
         args.height = MAP_IMG_HEIGHT_PX if is_map else IMG_HEIGHT_PX
     if args.align is None:
         args.align = DISTANCE_ALIGN
+    if math.isinf(OFFICIAL_TOTAL_KM) and (args.view != "laps"
+                                          or args.align != "none"):
+        sys.exit("The event config has no event.total_km — needed for the "
+                 "profile/map views and for distance alignment")
 
 
 def read_pos_file(path):
@@ -1329,7 +1748,10 @@ def main():
     map_fn, report = build_km_mapper(track, args.align)
     print(f"Distance alignment: {report}")
 
-    course = prepare_course(track, map_fn)
+    course = prepare_course(track, map_fn, laps=args.view == "laps")
+    if course.laps:
+        print(f"Laps: {course.laps.count} found"
+              + (" (the last one unfinished)" if course.laps.tail else ""))
     os.makedirs(args.out_dir, exist_ok=True)
 
     burn = BURN_LABEL and not args.no_label
@@ -1354,7 +1776,9 @@ def main():
                                hr=hr_at(at) if live else None,
                                pace_s_km=pace_at(at) if live else None,
                                show_hr=bool(live and args.hr),
-                               show_pace=bool(live and args.pace))
+                               show_pace=bool(live and args.pace),
+                               laps=(course.laps.state(km, when)
+                                     if course.laps else None))
         name = f"{FILENAME_PREFIX}_km{km:05.1f}"
         if custom:
             name += "_" + re.sub(r"[^A-Za-z0-9]+", "-", custom).strip("-").lower()
