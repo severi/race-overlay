@@ -35,8 +35,10 @@ No test suite; verify visually (see below).
 - `resolve_add_overlays.py` — runs inside DaVinci Resolve (free edition =
   Workspace > Scripts only, no external API), matches timeline clips to
   `overlay_<stem>_km*.mov` (from `gopro_batch.py --mov`: QuickTime
-  Animation + alpha, animated every `--mov-step` s, unchanged frames
-  merged via the ffmpeg concat demuxer, ~0.06 MB/s; the 79 Nuuksio clips
+  Animation + alpha, animated every `--mov-step` s (position interpolated
+  between the 1 Hz samples; frames rendered panel-sized and padded to the
+  canvas by ffmpeg — a 4K PNG per frame was the bottleneck), unchanged
+  frames merged via the ffmpeg concat demuxer, ~0.06 MB/s; the 79 Nuuksio clips
   take ~2 min on all cores) and places them on an "Overlays" track.
   Videos, not stills: Resolve's `AppendToTimeline` ignores startFrame/
   endFrame for stills (always the "Standard still duration" preference)
@@ -107,6 +109,21 @@ bg.alpha_composite(img)
   (`OFFICIAL_TOTAL_KM = inf`, alignment `none`); other views refuse that.
   The loop profile is the per-fraction median of all laps, lightly smoothed
   (`LOOP_SMOOTH_WINDOW_M`) — the normal 150 m window shaves the summit.
+  `laps.style = "3d"` = a different HUD, not just a different graphic:
+  info column left (`_draw_laps_column`, fixed `LAPS_3D_COL_PX` so the loop
+  does not jump), 3-D loop right (`_draw_loop_3d`), no pips, no bottom
+  strip. Owner's brief: "a HUD, not in your face" — hence the faint walls
+  (`LOOP3D_*` constants), thin lines, small marker, and heavy ring
+  smoothing of plan + elevation (`LOOP3D_SMOOTH_M`; raw medians look rough
+  with z exaggerated). Tried and dropped: a wide strip layout with the 3-D
+  graphic, fence posts, 55 % walls, depth-shaded ribbon runs (looked
+  segmented). The projection is hand-rolled oblique parallel (no mplot3d).
+  Walls are filled as PANELS split where the screen direction reverses,
+  never one polygon per wall: descent and climb run in opposite screen
+  directions, so a single polygon's windings cancel where the walls
+  overlap and the fill leaves a hole (owner saw it as "transparent with a
+  white bottom"). Always judge the look composited on real footage, not a
+  flat dark backdrop — alphas that look fine there vanish on bright grass.
 - Map view: the stats column is drawn first and measured, and the map axes
   take the remaining width (long "Next <name>" lines widen the column).
   Route is a flat equirectangular projection around the track centre — fine

@@ -69,17 +69,23 @@ def clip_fps(path, default=25.0):
         return default
 
 
-def encode_overlay_video(frames, mov, fps):
+def encode_overlay_video(frames, mov, fps, pad=None):
     """Alpha video from [(png, seconds), ...] held frames (QuickTime
-    Animation/RLE: an unchanged frame costs almost nothing)."""
+    Animation/RLE: an unchanged frame costs almost nothing). pad =
+    (canvas w, canvas h, x, y) places the frames on a transparent canvas
+    here, which is far cheaper than a full-frame PNG per frame."""
     lst = mov + ".txt"
     with open(lst, "w") as f:
         for png, secs in frames:
             f.write(f"file '{os.path.abspath(png)}'\nduration {secs:.3f}\n")
         f.write(f"file '{os.path.abspath(frames[-1][0])}'\n")  # concat quirk
     cmd = ["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0",
-           "-i", lst, "-fps_mode", "cfr", "-r", f"{fps:g}", "-c:v", "qtrle",
-           "-g", str(MOV_KEYFRAME_EVERY), "-pix_fmt", "argb", mov]
+           "-i", lst]
+    if pad:
+        cw, ch, x, y = pad
+        cmd += ["-vf", f"format=argb,pad={cw}:{ch}:{x}:{y}:color=black@0"]
+    cmd += ["-fps_mode", "cfr", "-r", f"{fps:g}", "-c:v", "qtrle",
+            "-g", str(MOV_KEYFRAME_EVERY), "-pix_fmt", "argb", mov]
     subprocess.run(cmd, check=True)
     os.remove(lst)
 
@@ -104,11 +110,17 @@ def _render_clip_video(job):
                                    _W["args"])
     step = args.mov_step
     fps = clip_fps(path)
+    # frames are rendered panel-sized; ffmpeg pads them to the canvas
+    pad = None
+    if args.canvas:
+        pad = (*args.canvas, *ro.canvas_offset(
+            (args.width, args.height), args.canvas, args.anchor, args.margin))
+        args = argparse.Namespace(**{**vars(args), "canvas": None})
     with tempfile.TemporaryDirectory(prefix="overlay_frames_") as tmp:
         frames, prev, t, n = [], None, 0.0, 0
         while t < seconds:
             km, label = lookup(utc + datetime.timedelta(seconds=t))
-            key = (round(km, 3), _label_key(label))
+            key = (round(km, 4), _label_key(label))
             if key == prev:
                 frames[-1][1] += step
             else:
@@ -118,7 +130,7 @@ def _render_clip_video(job):
                 frames.append([png, step])
                 prev = key
             t += step
-        encode_overlay_video(frames, out_mov, fps)
+        encode_overlay_video(frames, out_mov, fps, pad)
     return out_mov, n
 
 
@@ -201,7 +213,8 @@ def main():
                          "resolve_add_overlays.py")
     ap.add_argument("--mov-step", type=float, default=2.0, metavar="SEC",
                     help="re-render the overlay every SEC seconds of clip "
-                         "time in the .mov (default 2)")
+                         "time in the .mov (default 2; the laps view, where "
+                         "the marker laps a short loop, wants ~0.2)")
     ap.add_argument("--jobs", type=int, default=None,
                     help="parallel .mov renders (default: CPU count)")
     args = ap.parse_args()
@@ -228,9 +241,17 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     def lookup(utc_t):
-        """(official km, label) for a moment in UTC."""
+        """(official km, label) for a moment in UTC. The distance is
+        interpolated between the (1 Hz) samples, so an animated overlay
+        moves smoothly at any --mov-step."""
         i = min(bisect_left(track.ts, utc_t), len(track.ts) - 1)
-        km = min(map_fn(track.dist_km[i]), ro.OFFICIAL_TOTAL_KM)
+        raw = track.dist_km[i]
+        if 0 < i and track.ts[i - 1] < utc_t < track.ts[i]:
+            gap = (track.ts[i] - track.ts[i - 1]).total_seconds()
+            if gap <= ro.MOVING_MAX_GAP_S:
+                f = (utc_t - track.ts[i - 1]).total_seconds() / gap
+                raw = track.dist_km[i - 1] + f * (raw - track.dist_km[i - 1])
+        km = min(map_fn(raw), ro.OFFICIAL_TOTAL_KM)
         label = None
         if not args.no_label:
             when = None if args.no_time else min(max(utc_t, track.ts[0]),

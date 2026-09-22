@@ -94,6 +94,15 @@ LAP_TIME_LIMIT_H = None     # race time limit, hours (None: no countdown)
 LAP_KM = None               # official loop length (None: median recorded)
 LAP_START_RADIUS_M = 30.0   # a pass this close to the start point = boundary
 LAP_MIN_S = 120.0           # ... unless the previous one was under this ago
+# The loop graphic: "profile" (flat elevation profile of one loop) or "3d"
+# (the loop as a ribbon in space over its ground outline — track AND
+# elevation; needs GPS). The 3-D camera: azimuth None = side-on to the
+# loop's long axis with the climb running left to right.
+LAP_STYLE = "profile"
+LAP_VIEW_AZIMUTH_DEG = None
+LAP_VIEW_ROTATE_DEG = 20.0  # turned this far from side-on (auto azimuth only)
+LAP_VIEW_TILT_DEG = 50.0    # 0 = from the side, 90 = from straight above
+LAP_Z_EXAGGERATION = 2.0
 # Does the lap in progress when the time runs out still count? If not, it
 # is drawn as "not counted" from the moment the limit passes.
 LATE_LAP_COUNTS = False
@@ -134,7 +143,9 @@ def load_event(path=None):
     import tomllib
     global CHECKPOINTS, OFFICIAL_TOTAL_KM, FINISH_LABEL, START_LABEL, \
         FINISH_LABEL_POS, VIEW, LAP_TIME_LIMIT_H, LAP_KM, \
-        LAP_START_RADIUS_M, LAP_MIN_S, LATE_LAP_COUNTS, \
+        LAP_START_RADIUS_M, LAP_MIN_S, LATE_LAP_COUNTS, LAP_STYLE, \
+        LAP_VIEW_AZIMUTH_DEG, LAP_VIEW_ROTATE_DEG, LAP_VIEW_TILT_DEG, \
+        LAP_Z_EXAGGERATION, \
         GAIN_SMOOTH_WINDOW_M, DISTANCE_ALIGN, REST_MAX_SPEED_MS, \
         REST_MIN_DURATION_S, MATCH_TOLERANCE_KM, LOCAL_UTC_OFFSET_HOURS, CAMERA_UTC_OFFSET_HOURS, \
         CAMERA_CLOCK_BEHIND_S
@@ -191,6 +202,15 @@ def load_event(path=None):
     LAP_START_RADIUS_M = float(lp.get("start_radius_m", LAP_START_RADIUS_M))
     LAP_MIN_S = float(lp.get("min_lap_s", LAP_MIN_S))
     LATE_LAP_COUNTS = bool(lp.get("late_lap_counts", LATE_LAP_COUNTS))
+    LAP_STYLE = str(lp.get("style", LAP_STYLE)).lower()
+    if LAP_STYLE not in ("profile", "3d"):
+        sys.exit(f"{path}: laps.style must be \"profile\" or \"3d\"")
+    az = lp.get("view_azimuth_deg", LAP_VIEW_AZIMUTH_DEG)
+    LAP_VIEW_AZIMUTH_DEG = float(az) if az is not None else None
+    LAP_VIEW_ROTATE_DEG = float(lp.get("view_rotate_deg",
+                                       LAP_VIEW_ROTATE_DEG))
+    LAP_VIEW_TILT_DEG = float(lp.get("view_tilt_deg", LAP_VIEW_TILT_DEG))
+    LAP_Z_EXAGGERATION = float(lp.get("z_exaggeration", LAP_Z_EXAGGERATION))
 
     al = cfg.get("alignment", {})
     DISTANCE_ALIGN = al.get("mode", "none" if open_ended else DISTANCE_ALIGN)
@@ -216,6 +236,10 @@ IMG_WIDTH_PX = 1280
 IMG_HEIGHT_PX = 400
 IMG_DPI = 100
 # The map view is squarer: stats column on the left, route on the right.
+LAPS_3D_IMG_WIDTH_PX = 800          # laps view, 3-D style: info column on
+LAPS_3D_IMG_HEIGHT_PX = 430         # the left, the loop on the right
+LAPS_3D_COL_PX = 345                # width of that column (fixed, so the
+                                    # loop does not jump between frames)
 LAP_PIP_PITCH_PX = 17               # laps view: spacing / radius of the lap
 LAP_PIP_RADIUS_PX = 5               # pips (shrunk to fit when there are many)
 LAP_URGENT_S = 600                  # countdown turns accent under this
@@ -607,6 +631,15 @@ def _prepare_route(kms, lat, lon):
 # Laps (laps view): boundaries from the GPS track, one averaged loop profile
 # ============================================================================
 
+# 3-D style: deliberately light — it is a HUD, the footage is the picture.
+LOOP3D_WALL_ALPHA = 0.07    # the not-yet-done wall (overlapping walls add up)
+LOOP3D_DONE_ALPHA = 0.22    # ... and the completed wall
+LOOP3D_GROUND_SHADOW = 0.12  # black fill of the loop's footprint
+LOOP3D_RIBBON_LW = 1.5      # the track line
+LOOP3D_TRAIL_LW = 2.2       # accent trail over the completed part
+LOOP3D_DOT_SCALE = 0.6      # marker size relative to HERE_DOT_SIZE
+LOOP3D_SMOOTH_M = 90        # ribbon smoothing (plan and elevation), round
+                            # the ring: a diagram, not a survey
 LOOP_PROFILE_POINTS = 240   # vertices of the loop profile
 LOOP_SMOOTH_WINDOW_M = 40   # light: averaging the laps already kills noise,
                             # and a wide window would shave the summit
@@ -625,6 +658,8 @@ class Laps:
     ly: list            # loop profile: elevation
     track_ts: list      # per-sample time / km, to find the time of a km
     track_kms: list
+    gx: list = None     # loop in plan: local east / north metres per profile
+    gy: list = None     # vertex (None without GPS) — the 3-D style
 
     @property
     def count(self):
@@ -756,13 +791,53 @@ def prepare_laps(track, kms):
     ly = [sorted(col)[len(col) // 2] for col in columns]
     ly = _smooth_elevation(lx, ly, LOOP_SMOOTH_WINDOW_M)
 
+    gx, gy = _loop_plan(track, kms, bounds, n)
+
     ts = [track.ts[b] for b in bounds]
     bkms = [kms[b] for b in bounds]
     tail = kms[-1] - bkms[-1] >= LAP_TAIL_MIN_FRACTION * median_km
     if tail:    # lap in progress when the recording ends: never completed
         ts.append(datetime.max)
         bkms.append(bkms[-1] + median_km)
-    return Laps(ts, bkms, tail, lap_km, lx, ly, track.ts, kms)
+    return Laps(ts, bkms, tail, lap_km, lx, ly, track.ts, kms, gx, gy)
+
+
+def _loop_plan(track, kms, bounds, n):
+    """The loop seen from above, one (east, north) metre pair per profile
+    vertex: per-fraction median of all laps like the elevation, lightly
+    smoothed, and closed (the median's two ends miss each other by some
+    metres of GPS scatter; the gap is spread along the loop)."""
+    fixes = [(la, lo) for la, lo in zip(track.lat, track.lon)
+             if la is not None and lo is not None]
+    lat0 = sum(f[0] for f in fixes) / len(fixes)
+    lon0 = sum(f[1] for f in fixes) / len(fixes)
+    mx, my = 111320.0 * math.cos(math.radians(lat0)), 110574.0
+    cols_x = [[] for _ in range(n + 1)]
+    cols_y = [[] for _ in range(n + 1)]
+    for a, b in zip(bounds, bounds[1:]):
+        pts = [(kms[i], (track.lon[i] - lon0) * mx, (track.lat[i] - lat0) * my)
+               for i in range(a, b + 1) if track.lat[i] is not None
+               and track.lon[i] is not None]
+        if len(pts) < 2 or pts[-1][0] <= pts[0][0]:
+            continue
+        pk, px, py = zip(*pts)
+        span = pk[-1] - pk[0]
+        for c in range(n + 1):
+            k = pk[0] + span * c / n
+            cols_x[c].append(interp(pk, px, k))
+            cols_y[c].append(interp(pk, py, k))
+    if not cols_x[0]:
+        return None, None
+    out = []
+    for cols in (cols_x, cols_y):
+        med = [sorted(col)[len(col) // 2] for col in cols]
+        gap = med[-1] - med[0]
+        ring = [v - gap * c / n for c, v in enumerate(med)][:n]
+        half = 4    # smoothed round the ring, so the ends still meet
+        smooth = [sum(ring[(c + d) % n] for d in range(-half, half + 1)) /
+                  (2 * half + 1) for c in range(n)]
+        out.append(smooth + smooth[:1])
+    return out[0], out[1]
 
 
 def interp(px, py, x):
@@ -886,15 +961,21 @@ def render(course, here_km, out_path, label_text, args):
         _place_on_canvas(out_path, args.canvas, args.anchor, args.margin)
 
 
+def canvas_offset(size, canvas, anchor, margin):
+    """Top-left (x, y) of a size = (w, h) graphic on the canvas."""
+    (w, h), (cw, ch), margin = size, canvas, margin or 0
+    x = margin if "left" in anchor else cw - margin - w
+    y = margin if "top" in anchor else ch - margin - h
+    if anchor in ("top", "bottom"):
+        x = (cw - w) // 2
+    return x, y
+
+
 def _place_on_canvas(path, canvas, anchor, margin):
     from PIL import Image
     cw, ch = canvas
     img = Image.open(path).convert("RGBA")
-    margin = margin or 0
-    x = margin if "left" in anchor else cw - margin - img.width
-    y = margin if "top" in anchor else ch - margin - img.height
-    if anchor in ("top", "bottom"):
-        x = (cw - img.width) // 2
+    x, y = canvas_offset(img.size, canvas, anchor, margin)
     out = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
     out.alpha_composite(img, (x, y))
     out.save(path)
@@ -1013,15 +1094,37 @@ def _render_profile(px, py, here_km, out_path, label_text, args):
 
 
 def _render_laps(course, here_km, out_path, label_text, args):
-    """Lap race: the profile of one loop, the marker going round it every
-    lap; lap counter, lap pips and the countdown around it."""
+    """Lap race: one loop — as a flat profile or as a 3-D ribbon
+    (laps.style) — with the marker going round it every lap; lap counter,
+    lap pips and the countdown around it."""
     laps = course.laps
     st = (label_text or {}).get("laps") or laps.state(here_km)
     w, h, dpi = args.width, args.height, args.dpi
     fig = plt.figure(figsize=(w / dpi, h / dpi), dpi=dpi)
     fig.patch.set_alpha(0)
     _draw_scrim(fig, w, h)
-    label_room = 0.27 if label_text else 0.05
+    strip = None
+    if label_text:
+        strip = " · ".join(label_text["bottom_lines"] + [
+            f"{cap} {val}" for cap, val in label_text.get("live") or []])
+    # a lap that will not count banks nothing: no bright "done" part
+    banked = not (st["void"] or (st["finished"] and st["late"]))
+    if LAP_STYLE == "3d":
+        k = dpi / IMG_DPI   # pixel constants are tuned for IMG_DPI
+        x0 = (LAPS_3D_COL_PX * k if label_text else 0.035 * w) / w
+        _draw_loop_3d(fig, laps, st, banked, [x0, 0.06, 0.965 - x0, 0.88])
+        if label_text:
+            _draw_laps_column(fig, label_text, st, w, h, k)
+    else:
+        _draw_loop_profile(fig, laps, st, banked, strip, bool(label_text))
+        if label_text:
+            _draw_laps_header(fig, label_text, st, w, h)
+    fig.savefig(out_path, transparent=True, dpi=dpi)
+    plt.close(fig)
+
+
+def _draw_loop_profile(fig, laps, st, banked, strip, labelled):
+    label_room = 0.27 if labelled else 0.05
     ax = fig.add_axes([0.035, 0.155, 0.93, 0.80 - label_room])
     ax.set_facecolor("none")
 
@@ -1033,8 +1136,6 @@ def _render_laps(course, here_km, out_path, label_text, args):
     dx, dy = px[:i] + [here], py[:i] + [here_ele]
     tx, ty = [here] + px[i:], [here_ele] + py[i:]
 
-    # a lap that will not count banks nothing: no bright "done" fill
-    banked = not (st["void"] or (st["finished"] and st["late"]))
     ax.fill_between(dx, floor, dy, color=MONO, lw=0, zorder=2,
                     alpha=ALPHA_FILL_DONE if banked else ALPHA_FILL_TODO)
     ax.fill_between(tx, floor, ty, color=MONO, alpha=ALPHA_FILL_TODO,
@@ -1050,18 +1151,17 @@ def _render_laps(course, here_km, out_path, label_text, args):
     # summit and low point, with their elevations
     top = max(range(len(py)), key=py.__getitem__)
     low = min(range(len(py)), key=py.__getitem__)
-    for idx, name, dy_pt, va in ((top, "TOP", 9, "bottom"),
-                                 (low, "LOW", 9, "bottom")):
+    for idx, name in ((top, "TOP"), (low, "LOW")):
         ax.plot([px[idx], px[idx]], [floor, py[idx]], color=MONO, lw=0.8,
                 alpha=0.22, zorder=4)
         ax.scatter([px[idx]], [py[idx]], s=26, color=MONO, alpha=0.95, lw=0,
                    zorder=6)
         ax.annotate(_tracked(f"{name} {py[idx]:.0f} m"), (px[idx], py[idx]),
-                    xytext=(0, dy_pt), textcoords="offset points",
-                    ha="center", va=va, color=MONO, fontsize=FONT_SIZE_PIT,
-                    fontweight="bold", family=FONT_FAMILY,
-                    path_effects=_text_fx(2.0, 0.65), zorder=7,
-                    annotation_clip=False)
+                    xytext=(0, 9), textcoords="offset points",
+                    ha="center", va="bottom", color=MONO,
+                    fontsize=FONT_SIZE_PIT, fontweight="bold",
+                    family=FONT_FAMILY, path_effects=_text_fx(2.0, 0.65),
+                    zorder=7, annotation_clip=False)
 
     ax.scatter([here], [here_ele], s=HERE_DOT_SIZE * 2.8, color=ACCENT,
                alpha=0.28, lw=0, zorder=7, clip_on=False)
@@ -1075,21 +1175,237 @@ def _render_laps(course, here_km, out_path, label_text, args):
                     textcoords="offset points", ha=ha, color=MONO,
                     alpha=0.95, fontsize=FONT_SIZE_AXIS, family=FONT_FAMILY,
                     path_effects=_text_fx(2.0, 0.65), annotation_clip=False)
-    if label_text:
-        strip = " · ".join(label_text["bottom_lines"] + [
-            f"{cap} {val}" for cap, val in label_text.get("live") or []])
+    if strip:
         ax.annotate(_tracked(strip), (lap_km / 2, floor), xytext=(0, -15),
                     textcoords="offset points", ha="center", color=MONO,
                     fontsize=FONT_SIZE_LABEL_SUB, fontweight="bold",
                     family=FONT_FAMILY, path_effects=_text_fx(2.0, 0.65),
                     annotation_clip=False)
-        _draw_laps_header(fig, label_text, st, w, h)
 
     ax.set_xlim(-0.006 * lap_km, 1.006 * lap_km)
     ax.set_ylim(floor - 5, max(py) + 30)
     ax.axis("off")
-    fig.savefig(out_path, transparent=True, dpi=dpi)
-    plt.close(fig)
+
+
+def _loop_camera(laps):
+    """(azimuth, tilt, z scale) for the 3-D loop. Default azimuth: side-on
+    to the loop's long axis, from the side that has the climb running left
+    to right."""
+    if LAP_VIEW_AZIMUTH_DEG is not None:
+        az = LAP_VIEW_AZIMUTH_DEG
+    else:
+        n = len(laps.gx)
+        cx, cy = sum(laps.gx) / n, sum(laps.gy) / n
+        sxx = sum((x - cx) ** 2 for x in laps.gx)
+        syy = sum((y - cy) ** 2 for y in laps.gy)
+        sxy = sum((x - cx) * (y - cy) for x, y in zip(laps.gx, laps.gy))
+        az = -math.degrees(0.5 * math.atan2(2 * sxy, sxx - syy))
+        top = max(range(n), key=laps.ly.__getitem__)
+        low = min(range(n), key=laps.ly.__getitem__)
+        a = math.radians(az)
+        screen_x = [x * math.cos(a) - y * math.sin(a)
+                    for x, y in ((laps.gx[i], laps.gy[i]) for i in (top, low))]
+        if screen_x[0] < screen_x[1]:
+            az += 180
+        az += LAP_VIEW_ROTATE_DEG
+    return az, LAP_VIEW_TILT_DEG, LAP_Z_EXAGGERATION
+
+
+def _fill_wall_panel(ax, panel, done_alpha):
+    """One wall panel: [(top, ground, done), ...] in track order."""
+    if len(panel) < 2:
+        return
+    tops = [p[0] for p in panel]
+    grounds = [p[1] for p in panel]
+    ax.fill(*zip(*(tops + grounds[::-1])), color=MONO, lw=0, zorder=2,
+            alpha=done_alpha if panel[0][2] else LOOP3D_WALL_ALPHA)
+
+
+def _ring_smooth(values, half):
+    """Moving average round a closed ring (values[0] == values[-1])."""
+    ring = values[:-1]
+    n = len(ring)
+    out = [sum(ring[(c + d) % n] for d in range(-half, half + 1)) /
+           (2 * half + 1) for c in range(n)]
+    return out + out[:1]
+
+
+def _draw_loop_3d(fig, laps, st, banked, rect):
+    """The loop as a ribbon in space: a translucent wall from the track
+    down to the ground plane, the ground outline (= the track in plan)
+    under it. Oblique parallel projection, no perspective — it stays a
+    readable diagram."""
+    if not laps.gx:
+        sys.exit("laps.style = \"3d\" needs GPS positions in the activity "
+                 "file (use style = \"profile\")")
+    az, tilt, zex = _loop_camera(laps)
+    a, tl = math.radians(az), math.radians(tilt)
+    n = len(laps.gx)
+    cx, cy = sum(laps.gx) / n, sum(laps.gy) / n
+    base = min(laps.ly) - ELEV_FLOOR_PAD_M
+    # close the ribbon (the median profile's ends differ by a metre or two)
+    # and smooth plan + elevation round the ring: raw, the line looks rough,
+    # the more so with the elevation exaggerated
+    z_gap = laps.ly[-1] - laps.ly[0]
+    zs = [z - z_gap * i / (n - 1) for i, z in enumerate(laps.ly)]
+    half = max(int(LOOP3D_SMOOTH_M / 2 / (laps.lap_km * 1000 / (n - 1))), 1)
+    zs, gx, gy = (_ring_smooth(v, half) for v in (zs, laps.gx, laps.gy))
+
+    def proj(i, z=None):
+        x, y = gx[i] - cx, gy[i] - cy
+        depth = x * math.sin(a) + y * math.cos(a)
+        z = zs[i] if z is None else z
+        return (x * math.cos(a) - y * math.sin(a),
+                depth * math.sin(tl) + (z - base) * zex * math.cos(tl))
+
+    top = [proj(i) for i in range(n)]
+    ground = [proj(i, base) for i in range(n)]
+
+    ax = fig.add_axes(rect)
+    ax.set_facecolor("none")
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    # "here", interpolated between vertices so the marker moves smoothly
+    pos = st["frac"] * (n - 1)
+    i0 = min(int(pos), n - 2)
+    f = pos - i0
+    mix = lambda p, q: (p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f)  # noqa: E731
+    here, here_ground = mix(top[i0], top[i0 + 1]), mix(ground[i0], ground[i0 + 1])
+
+    # depth cue that survives bright footage: a shadow on the ground
+    ax.fill(*zip(*ground), color="black", alpha=LOOP3D_GROUND_SHADOW, lw=0,
+            zorder=1)
+    # Walls. NOT one polygon per wall: the descent runs right-to-left on
+    # screen and the climb left-to-right, so where the two walls overlap
+    # their windings cancel and the fill leaves a hole. Instead a panel ends
+    # wherever the screen direction reverses (and at "here"): between two
+    # reversals ribbon and ground line are both x-monotone, so the panel is
+    # a simple polygon, and at a reversal the wall folds back on itself, so
+    # no seam shows. Where walls overlap the alphas add up — two walls
+    # behind each other. Same-colour translucent layers need no depth sort.
+    done_top = top[:i0 + 1] + [here]
+    wall = ([(top[i], ground[i], True) for i in range(i0 + 1)] +
+            [(here, here_ground, False)] +
+            [(top[i], ground[i], False) for i in range(i0 + 1, n)])
+    done_alpha = LOOP3D_DONE_ALPHA if banked else LOOP3D_WALL_ALPHA
+    panel, direction = [wall[0]], 0
+    for k, (prev, cur) in enumerate(zip(wall, wall[1:])):
+        dx = cur[0][0] - prev[0][0]
+        step = (dx > 0) - (dx < 0)
+        if step and direction and step != direction:
+            _fill_wall_panel(ax, panel, done_alpha)   # prev = turning point
+            panel = [prev]
+        direction = step or direction
+        panel.append(cur)
+        if k == i0:     # cur is "here": the done wall ends
+            _fill_wall_panel(ax, panel, done_alpha)
+            panel = [cur]
+    _fill_wall_panel(ax, panel, done_alpha)
+    ax.plot(*zip(*ground), color=MONO, lw=1.0, alpha=0.45, zorder=3,
+            solid_capstyle="round", solid_joinstyle="round")
+    ax.plot(*zip(*top), color=MONO, lw=LOOP3D_RIBBON_LW, alpha=ALPHA_LINE,
+            zorder=4, solid_capstyle="round", solid_joinstyle="round",
+            path_effects=_line_fx(1.5, 0.35))
+    if banked and len(done_top) > 1:
+        ax.plot(*zip(*done_top), color=ACCENT, lw=LOOP3D_TRAIL_LW, alpha=0.95,
+                zorder=5, solid_capstyle="round", solid_joinstyle="round")
+
+    # labels keep out of the loop's way and inside the panel: the leftmost
+    # mark is labelled under the ground line, the rightmost above, text
+    # running inwards; any other above
+    i_top = max(range(n), key=zs.__getitem__)
+    i_low = min(range(n), key=zs.__getitem__)
+    marks = [(i_top, f"TOP {max(laps.ly):.0f} m"),
+             (i_low, f"LOW {min(laps.ly):.0f} m"), (0, START_LABEL)]
+    left = min(marks, key=lambda m: top[m[0]][0])[0]
+    right = max(marks, key=lambda m: top[m[0]][0])[0]
+    for idx, text in marks:
+        ax.plot(*zip(top[idx], ground[idx]), color=MONO, lw=0.8, alpha=0.30,
+                zorder=3)
+        ax.scatter(*top[idx], s=18, color=MONO, alpha=0.95, lw=0, zorder=6)
+        if idx == left:
+            anchor, offset, ha, va = ground[idx], (-2, -7), "left", "top"
+        elif idx == right:
+            anchor, offset, ha, va = top[idx], (4, 8), "right", "bottom"
+        else:
+            anchor, offset, ha, va = top[idx], (0, 8), "center", "bottom"
+        ax.annotate(_tracked(text), anchor, xytext=offset,
+                    textcoords="offset points", ha=ha, va=va, color=MONO,
+                    fontsize=FONT_SIZE_AXIS - 1.5, fontweight="bold",
+                    family=FONT_FAMILY, path_effects=_text_fx(2.0, 0.65),
+                    zorder=8, annotation_clip=False)
+
+    ax.plot(*zip(here, here_ground), color=MONO, lw=0.9, alpha=0.55, zorder=6)
+    dot = HERE_DOT_SIZE * LOOP3D_DOT_SCALE
+    ax.scatter(*here, s=dot * 2.8, color=ACCENT, alpha=0.28, lw=0,
+               zorder=7, clip_on=False)
+    ax.scatter(*here, s=dot, color=ACCENT, edgecolors=MONO,
+               linewidths=1.5, zorder=8, clip_on=False)
+
+    # room for the labels above / below the shape
+    xs, ys = zip(*(top + ground))
+    padx = 0.04 * (max(xs) - min(xs))
+    pady = 0.16 * (max(ys) - min(ys))
+    ax.set_xlim(min(xs) - padx, max(xs) + padx)
+    ax.set_ylim(min(ys) - pady, max(ys) + pady)
+
+
+def _draw_laps_column(fig, label_text, st, w, h, k):
+    """Info column of the 3-D laps HUD, by importance: the lap, the laps
+    that count, the time left; then a small caption/value grid; clock,
+    ascent and distance at the bottom."""
+    x = 0.045
+    fx_big, fx_small = _text_fx(2.5, 0.6), _text_fx(2.0, 0.65)
+    dim = st["void"]    # lap in progress no longer counts
+
+    def text(y, s, size, weight="bold", color=MONO, alpha=1.0, va="top",
+             dx=0.0, fx=fx_small):
+        return fig.text(x + dx, y, s, ha="left", va=va, color=color,
+                        alpha=alpha, fontsize=size, fontweight=weight,
+                        family=FONT_FAMILY, path_effects=fx)
+
+    px = lambda v: v * k / h    # noqa: E731  (px at IMG_DPI -> figure fraction)
+    y = 0.93
+    text(y, label_text["value"], FONT_SIZE_LABEL_MAIN, "heavy",
+         alpha=0.45 if dim else 1.0,
+         fx=_text_fx(2.5, 0.25 if dim else 0.6))
+    y -= px(57)
+    if label_text.get("unit"):      # "NOT COUNTED"
+        text(y, _tracked(label_text["unit"]), FONT_SIZE_PIT, color=ACCENT)
+        y -= px(21)
+    f = label_text["fields"]
+    text(y, _tracked(f["completed"]), FONT_SIZE_LABEL_SUB)
+    y -= px(44)
+
+    if label_text.get("countdown"):
+        value, caption, urgent = label_text["countdown"]
+        colour = ACCENT if urgent else MONO
+        vt = text(y, value, FONT_SIZE_LIVE, "heavy", color=colour, fx=fx_big)
+        fig.canvas.draw()
+        bb = vt.get_window_extent(fig.canvas.get_renderer())
+        if caption:
+            fig.text(bb.x1 / w + 0.012, bb.y0 / h, _tracked(caption),
+                     ha="left", va="bottom", color=colour,
+                     fontsize=FONT_SIZE_PIT, fontweight="bold",
+                     family=FONT_FAMILY, path_effects=fx_small)
+        y -= px(54)
+
+    # caption/value grid, two per row
+    pairs = list(f["pairs"]) + [(cap, val.replace(" bpm", "").replace(" /km", ""))
+                                for cap, val in label_text.get("live") or []]
+    col_w = (LAPS_3D_COL_PX * k / w - x) / 2
+    for row in range(0, len(pairs), 2):
+        for c, (cap, val) in enumerate(pairs[row:row + 2]):
+            text(y, _tracked(cap), FONT_SIZE_PIT - 2, alpha=0.8,
+                 dx=c * col_w)
+            text(y - px(16), val, FONT_SIZE_LABEL_UNIT, "heavy",
+                 dx=c * col_w, fx=fx_big)
+        y -= px(53)
+
+    for row, line in enumerate(reversed(f["footer"])):
+        text(0.075 + row * px(22), _tracked(line), FONT_SIZE_PIT,
+             va="bottom", alpha=0.95)
 
 
 def _draw_laps_header(fig, label_text, st, w, h):
@@ -1110,11 +1426,13 @@ def _draw_laps_header(fig, label_text, st, w, h):
                  color=ACCENT if dim else MONO, fontsize=FONT_SIZE_LABEL_SUB,
                  fontweight="bold", family=FONT_FAMILY,
                  path_effects=_text_fx(2.0, 0.65))
+    stats_right = 0.035 * w
     if label_text.get("gain"):
-        fig.text(0.037, bb.y0 / h - 0.025, _tracked(label_text["gain"]),
-                 ha="left", va="top", color=MONO,
-                 fontsize=FONT_SIZE_LABEL_SUB, fontweight="bold",
-                 family=FONT_FAMILY, path_effects=_text_fx(2.0, 0.65))
+        gt = fig.text(0.037, bb.y0 / h - 0.025, _tracked(label_text["gain"]),
+                      ha="left", va="top", color=MONO,
+                      fontsize=FONT_SIZE_LABEL_SUB, fontweight="bold",
+                      family=FONT_FAMILY, path_effects=_text_fx(2.0, 0.65))
+        stats_right = gt.get_window_extent(renderer).x1
 
     clock = label_text.get("countdown")
     if clock:
@@ -1141,7 +1459,8 @@ def _draw_laps_header(fig, label_text, st, w, h):
     ov.axis("off")
     ov.set_facecolor("none")
     k = fig.dpi / IMG_DPI
-    pitch = min(LAP_PIP_PITCH_PX * k, 0.55 * w / max(len(pips), 1))
+    room = 0.965 * w - stats_right - 2 * LAP_PIP_PITCH_PX * k
+    pitch = min(LAP_PIP_PITCH_PX * k, room / max(len(pips), 1))
     r = min(LAP_PIP_RADIUS_PX * k, pitch * 0.36)
     size = (2 * r * 72 / fig.dpi) ** 2          # scatter size, pt^2
     y = bb.y0 - 0.025 * h - 0.5 * FONT_SIZE_LABEL_SUB * fig.dpi / 72
@@ -1473,10 +1792,24 @@ def _make_laps_label(st, here_km, when_utc, gain_m, custom, live):
             bottom.append(f"this lap {_ms(st['lap_s'])}")
             if st["last_s"] is not None:
                 bottom.append(f"last {_ms(st['last_s'])}")
+    # the same facts in pieces, for the 3-D style's info column
+    pairs, footer = [], []
+    if st["finished"]:
+        if st["last_s"] is not None:
+            pairs.append(("last lap", _ms(st["last_s"])))
+        if st["late"]:
+            footer.append(f"lap {st['late'][0]} · {_ms(st['late'][1])} over")
+    else:
+        pairs.append(("this lap", _ms(st["lap_s"])))
+        pairs.append(("last lap", _ms(st["last_s"])
+                      if st["last_s"] is not None else "-:--"))
+    footer.append(" · ".join(([bottom[0]] if when_utc is not None else [])
+                             + stats[1:]))
+    fields = {"completed": stats[0], "pairs": pairs, "footer": footer}
     return {"value": value, "unit": unit, "gain": " · ".join(stats),
             "right": [], "bottom": " · ".join(bottom),
             "bottom_lines": bottom, "live": live, "countdown": countdown,
-            "laps": st}
+            "laps": st, "fields": fields}
 
 
 def _pace_str(s_per_km):
@@ -1680,11 +2013,15 @@ def resolve_render_args(args):
         args.canvas = (int(m.group(1)), int(m.group(2)))
     if args.view is None:
         args.view = VIEW
-    is_map = args.view == "map"
+    default_w, default_h = IMG_WIDTH_PX, IMG_HEIGHT_PX
+    if args.view == "map":
+        default_w, default_h = MAP_IMG_WIDTH_PX, MAP_IMG_HEIGHT_PX
+    elif args.view == "laps" and LAP_STYLE == "3d":
+        default_w, default_h = LAPS_3D_IMG_WIDTH_PX, LAPS_3D_IMG_HEIGHT_PX
     if args.width is None:
-        args.width = MAP_IMG_WIDTH_PX if is_map else IMG_WIDTH_PX
+        args.width = default_w
     if args.height is None:
-        args.height = MAP_IMG_HEIGHT_PX if is_map else IMG_HEIGHT_PX
+        args.height = default_h
     if args.align is None:
         args.align = DISTANCE_ALIGN
     if math.isinf(OFFICIAL_TOTAL_KM) and (args.view != "laps"

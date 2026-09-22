@@ -13,6 +13,8 @@ for point-to-point and loop events: ultras, marathons, bike races.
 
 ![Example laps overlay](docs/example_laps.png)
 
+![Example 3-D laps overlay](docs/example_laps_3d.png)
+
 *The actual PNGs have a fully transparent background — shown here on a dark
 backdrop.*
 
@@ -107,7 +109,15 @@ button, so a missed press does no harm. `late_lap_counts` says whether the
 loop still in progress when the time runs out counts; if not, it is marked
 `NOT COUNTED` (dimmed lap number, crossed pip, `+1:24 OVER`) from that moment
 on while the completed count stands, and the final state reads e.g.
-`23 LAPS · lap 24 finished 3:35 over`. No `total_km` is needed: distances
+`23 LAPS · lap 24 finished 3:35 over`. With `[laps] style = "3d"` the HUD is
+a compact corner panel (800×430) instead: the stats in a column on the left
+— lap, laps that count, time left, then this/last lap, heart rate and pace —
+and on the right the loop as a ribbon in space, a faint wall from the track
+down to its ground outline, so you see the route *and* the elevation (no lap
+pips in this style). The camera defaults to 20° off side-on to the loop's
+long axis with the climb running left to right, tilt 50°, elevation ×2
+(`view_rotate_deg` / `view_azimuth_deg`, `view_tilt_deg`,
+`z_exaggeration`). No `total_km` is needed: distances
 stay as recorded. If the ascent total is off on a short, sharp loop, tune
 `event.gain_smooth_window_m` (default 100 m, calibrated on long courses).
 
@@ -115,7 +125,10 @@ stay as recorded. If the ascent total is off on a short, sharp loop, tune
 --mov` (needs ffmpeg) so each overlay is also an alpha video the length of
 its clip, animated: the position and stats are re-rendered every
 `--mov-step` seconds (default 2) of clip time, so a long clip keeps
-counting down. Then `resolve_add_overlays.py` puts every clip's overlay on
+counting down. The position is interpolated between the track's samples,
+so a small step gives smooth motion — worth it in the laps view, where the
+marker laps a short loop (`--mov-step 0.2`; costs render time, not much
+file size). Then `resolve_add_overlays.py` puts every clip's overlay on
 its own video track at the clip's exact position and length.
 Videos rather than stills because Resolve's API ignores the requested
 length for a still image. The script has to run from inside Resolve

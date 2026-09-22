@@ -15,6 +15,12 @@ gain_smooth_window_m = 40
 [laps]
 time_limit_h = 4        # the countdown; the watch was started on the gun
 lap_km = 1.2            # official loop length (x-axis of the loop profile)
+# The loop drawn as a 3-D ribbon over its ground outline (track + elevation)
+# with the stats in a column beside it, instead of the flat profile strip.
+# Camera defaults: 20 deg off side-on (climb running left to right), tilt 50,
+# elevation x2 — override with view_rotate_deg / view_azimuth_deg /
+# view_tilt_deg / z_exaggeration.
+style = "3d"
 # Laps are found from the GPS track: every return to within start_radius_m
 # of the first fix is a lap boundary (the lap button is ignored — one missed
 # press would merge two loops). Visits under min_lap_s apart are one visit.
